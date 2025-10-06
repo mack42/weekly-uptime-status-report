@@ -2,6 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 use csv::Reader;
 use dotenv::dotenv;
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -314,6 +315,7 @@ fn parse_duration_to_minutes(duration_str: &str) -> i32 {
 }
 
 fn extract_rca_and_preventative_measures(description: &str) -> String {
+    debug!("Attempting to extract RCA and Preventative Measures from description (length: {} chars)", description.len());
     let mut extracted_content = Vec::new();
 
     // Look for RCA section
@@ -322,9 +324,14 @@ fn extract_rca_and_preventative_measures(description: &str) -> String {
             if let Some(rca_content) = rca_match.get(1) {
                 let cleaned_rca = rca_content.as_str().trim();
                 if !cleaned_rca.is_empty() {
+                    debug!("Found RCA section: {}", cleaned_rca);
                     extracted_content.push(format!("RCA: {}", cleaned_rca));
+                } else {
+                    debug!("Found RCA section but content was empty after trimming");
                 }
             }
+        } else {
+            debug!("RCA pattern did not match");
         }
     }
 
@@ -334,27 +341,41 @@ fn extract_rca_and_preventative_measures(description: &str) -> String {
             if let Some(pm_content) = pm_match.get(1) {
                 let cleaned_pm = pm_content.as_str().trim();
                 if !cleaned_pm.is_empty() {
+                    debug!("Found Preventative Measures section: {}", cleaned_pm);
                     extracted_content.push(format!("Preventative Measures: {}", cleaned_pm));
+                } else {
+                    debug!("Found Preventative Measures section but content was empty after trimming");
                 }
             }
+        } else {
+            debug!("Preventative Measures pattern did not match");
         }
     }
 
     // If no specific sections found, look for any content that might be RCA-related
     if extracted_content.is_empty() {
+        debug!("No RCA or Preventative Measures sections found, looking for fallback keywords");
         // Look for lines that might contain root cause information
         for line in description.lines() {
             let line = line.trim();
             if line.to_lowercase().contains("root cause") ||
                line.to_lowercase().contains("caused by") ||
                line.to_lowercase().contains("due to") {
+                debug!("Found fallback RCA line: {}", line);
                 extracted_content.push(line.to_string());
                 break; // Just take the first relevant line to keep it concise
             }
         }
     }
 
-    extracted_content.join("\n")
+    let result = extracted_content.join("\n");
+    if result.is_empty() {
+        debug!("No RCA or Preventative Measures content extracted");
+    } else {
+        debug!("Extracted content: {}", result);
+    }
+
+    result
 }
 
 async fn call_lm_studio(
@@ -370,11 +391,21 @@ async fn call_lm_studio(
 
     for record in outages {
         let jira_desc = if let Some(jira_key) = extract_jira_key(&record.ticket) {
-            jira_details.get(&jira_key)
-                .and_then(|issue| issue.fields.description.as_ref())
-                .map(|d| extract_rca_and_preventative_measures(d))
-                .unwrap_or_default()
+            debug!("Processing JIRA ticket: {}", jira_key);
+            if let Some(issue) = jira_details.get(&jira_key) {
+                if let Some(desc) = issue.fields.description.as_ref() {
+                    debug!("JIRA description found for {}, extracting RCA/PM", jira_key);
+                    extract_rca_and_preventative_measures(desc)
+                } else {
+                    debug!("No description field found for {}", jira_key);
+                    String::new()
+                }
+            } else {
+                debug!("JIRA details not found in cache for {}", jira_key);
+                String::new()
+            }
         } else {
+            debug!("Could not extract JIRA key from ticket: {}", record.ticket);
             String::new()
         };
 
@@ -415,7 +446,7 @@ Raw data:
 
 CRITICAL REQUIREMENTS:
 - Each incident MUST clearly explain what we're doing to PREVENT it from happening again
-- If preventative measures aren't clear from the data, mention what should be done
+- If preventative measures aren't clear from the data, mention what should be done in the AI Recommendations section
 - Keep descriptions to 2-3 sentences maximum
 - Use the provided Start Time and End Time in UTC format (HH:MM - HH:MM)
 - Use Month day format (Sept 15th, not September 15)
@@ -423,6 +454,7 @@ CRITICAL REQUIREMENTS:
 - Combine root cause, immediate resolution, AND prevention steps
 - Include severity in parentheses if available
 - End the email portion with "Regards,"
+- This will be read by the CEO and CTO
 
 AFTER the email content, add a separate section titled "--- AI RECOMMENDATIONS ---" with any additional prevention suggestions you think would be beneficial that weren't mentioned in the incidents.
 "#,
@@ -441,7 +473,7 @@ AFTER the email content, add a separate section titled "--- AI RECOMMENDATIONS -
             },
             LMStudioMessage {
                 role: "user".to_string(),
-                content: prompt,
+                content: prompt.clone(),
             },
         ],
         temperature: 0.3,
@@ -453,7 +485,9 @@ AFTER the email content, add a separate section titled "--- AI RECOMMENDATIONS -
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
-    println!("Sending request to LM Studio...");
+    debug!("Sending request to LM Studio");
+    debug!("LM Studio request prompt:\n{}", prompt);
+
     let response = client
         .post(lm_studio_url)
         .json(&request)
@@ -466,7 +500,7 @@ AFTER the email content, add a separate section titled "--- AI RECOMMENDATIONS -
         return Err(format!("LM Studio API error {}: {}", status, error_text).into());
     }
 
-    println!("Parsing LM Studio response...");
+    debug!("Parsing LM Studio response");
     let response_text = response.text().await?;
 
     // Try to parse the JSON response
@@ -487,13 +521,14 @@ fn get_week_number(date: &NaiveDate) -> u32 {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenv().ok();
+    env_logger::init();
 
     let jira_token = env::var("JIRA_TOKEN")
         .expect("JIRA_TOKEN not found in environment variables");
 
     let jira_email = env::var("JIRA_EMAIL")
         .unwrap_or_else(|_| {
-            println!("JIRA_EMAIL not found, using default");
+            info!("JIRA_EMAIL not set, using default");
             "automation@sugarcrm.com".to_string()
         });
 
@@ -506,11 +541,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (week_start, week_end) = get_previous_week_range();
     let week_number = get_week_number(&week_start);
 
-    println!("Generating weekly stability report for week {} ({} - {})",
+    info!("Generating report for week {} ({} - {})",
              week_number,
              week_start.format("%B %d"),
              week_end.format("%B %d"));
-    println!("All times UTC\n");
 
     let file = File::open("outages.csv")?;
     let mut reader = Reader::from_reader(file);
@@ -522,7 +556,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let record: OutageRecord = match result {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Warning: Skipping invalid record: {}", e);
+                warn!("Skipping invalid record: {}", e);
                 continue;
             }
         };
@@ -540,35 +574,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
         date_a.cmp(&date_b)
     });
 
-    println!("Found {} outages for the previous week", outages.len());
-    println!("Fetching JIRA details...\n");
+    info!("Found {} outage(s)", outages.len());
+    debug!("Fetching JIRA details...");
 
     let mut jira_fetch_failed = false;
     for record in &outages {
         if let Some(jira_key) = extract_jira_key(&record.ticket) {
+            debug!("Found JIRA key: {}", jira_key);
             if !jira_details.contains_key(&jira_key) {
+                debug!("Fetching JIRA details for {}", jira_key);
                 match fetch_jira_details(&jira_key, &jira_email, &jira_token).await {
                     Ok(issue) => {
+                        debug!("Successfully fetched JIRA details for {}", jira_key);
                         jira_details.insert(jira_key.clone(), issue);
                     }
-                    Err(_) => {
-                        // Silently skip JIRA errors - the CSV has enough info
+                    Err(e) => {
+                        warn!("Failed to fetch JIRA details for {}: {}", jira_key, e);
                         jira_fetch_failed = true;
                     }
                 }
+            } else {
+                debug!("JIRA details already cached for {}", jira_key);
             }
+        } else {
+            debug!("No JIRA key found in ticket URL: {}", record.ticket);
         }
     }
 
     if jira_fetch_failed {
-        println!("Note: Some JIRA tickets could not be fetched. Using CSV data only.\n");
+        warn!("Some JIRA tickets could not be fetched, using CSV data only");
     }
 
     // Try to use LM Studio to format the report if configured
     let use_ai = env::var("USE_AI").unwrap_or_else(|_| "true".to_string()) == "true";
 
     if use_ai {
-        println!("Generating formatted report with AI (this may take a moment)...\n");
+        info!("Generating AI-formatted report...");
     }
 
     let ai_result = if use_ai {
@@ -595,8 +636,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("{}", ai_report);
         }
         Err(e) => {
-            eprintln!("Warning: Could not generate AI report: {}", e);
-            eprintln!("Falling back to standard format...\n");
+            warn!("Could not generate AI report: {}", e);
+            info!("Using standard format");
 
             // Fallback to original formatting
             println!("{}", "=".repeat(80));
